@@ -1,0 +1,6 @@
+# One public Cloudflare R2 media URL per line.
+# The bot will post them in this exact order and loop after the last item.
+# Supported extensions: .jpg, .jpeg, .png, .webp, .gif, .mp4, .mov, .m4v, .webm
+#
+# https://pub-example.r2.dev/0001.png
+# https://pub-example.r2.dev/0002.png

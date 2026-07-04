@@ -7,6 +7,7 @@ import re
 import shutil
 from datetime import datetime, time, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -36,6 +37,7 @@ TEST_INTERVAL_SECONDS = 30
 
 QUOTES_FILE = BASE_DIR / "quotes.txt"
 IMAGES_DIR = BASE_DIR / "images"
+MEDIA_URLS_FILE = Path(os.getenv("MEDIA_URLS_FILE", BASE_DIR / "media_urls.txt"))
 DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -182,17 +184,72 @@ def natural_sort_key(value):
 
 
 def load_media_files(path=IMAGES_DIR):
+    if not path.exists():
+        return []
+
     media_names = [
         item.name
         for item in path.iterdir()
         if item.is_file() and item.suffix.lower() in MEDIA_EXTENSIONS
     ]
 
-    return sorted(media_names, key=natural_sort_key)
+    return [
+        {
+            "type": "local",
+            "name": name,
+            "value": name,
+            "extension": Path(name).suffix.lower(),
+        }
+        for name in sorted(media_names, key=natural_sort_key)
+    ]
+
+
+def media_extension_from_url(url):
+    return Path(urlparse(url).path).suffix.lower()
+
+
+def load_media_urls(path=MEDIA_URLS_FILE):
+    if not path.exists():
+        return []
+
+    with open(path, "r", encoding="utf-8") as f:
+        urls = [
+            line.strip()
+            for line in f
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+    media_urls = []
+    for url in urls:
+        extension = media_extension_from_url(url)
+        if extension not in MEDIA_EXTENSIONS:
+            raise RuntimeError(
+                f"Unsupported media URL extension in {path.name}: {url}"
+            )
+        media_urls.append(
+            {
+                "type": "url",
+                "name": url,
+                "value": url,
+                "extension": extension,
+            }
+        )
+
+    return media_urls
+
+
+def load_media():
+    media_urls = load_media_urls()
+    if media_urls:
+        print(f"Using media URLs from {MEDIA_URLS_FILE.name}")
+        return media_urls
+
+    print(f"Using local media files from {IMAGES_DIR.name}/")
+    return load_media_files()
 
 
 quotes, empty_quote_count = load_quotes()
-images = load_media_files()
+images = load_media()
 
 if not quotes:
     raise RuntimeError("quotes.txt does not contain any quotes")
@@ -246,9 +303,7 @@ def advance_image():
     state["image_index"] = (state.get("image_index", 0) + 1) % len(images)
 
 
-def media_size_limit(path):
-    extension = path.suffix.lower()
-
+def media_size_limit(extension):
     if extension in IMAGE_EXTENSIONS:
         return MAX_PHOTO_BYTES
     if extension in ANIMATION_EXTENSIONS:
@@ -267,16 +322,20 @@ def pick_allowed_media():
     checked_count = 0
 
     while checked_count < len(images):
-        image_name, image_number = current_image()
-        media_path = IMAGES_DIR / image_name
+        media_item, image_number = current_image()
+
+        if media_item["type"] == "url":
+            return media_item, image_number
+
+        media_path = IMAGES_DIR / media_item["value"]
         size = media_path.stat().st_size
-        limit = media_size_limit(media_path)
+        limit = media_size_limit(media_item["extension"])
 
         if size <= limit:
-            return image_name, image_number, media_path
+            return media_item, image_number
 
         print(
-            f"Skipped media {image_number}/{len(images)} ({image_name}): "
+            f"Skipped media {image_number}/{len(images)} ({media_item['name']}): "
             f"{format_bytes(size)} is larger than limit {format_bytes(limit)}"
         )
         advance_image()
@@ -286,40 +345,52 @@ def pick_allowed_media():
     raise RuntimeError("All media files are larger than Telegram limits")
 
 
+async def send_media(media_item, caption):
+    extension = media_item["extension"]
+    media_value = media_item["value"]
+
+    if media_item["type"] == "local":
+        media_path = IMAGES_DIR / media_value
+        with open(media_path, "rb") as media:
+            return await send_media_value(media, extension, caption)
+
+    return await send_media_value(media_value, extension, caption)
+
+
+async def send_media_value(media, extension, caption):
+    if extension in ANIMATION_EXTENSIONS:
+        return await application.bot.send_animation(
+            chat_id=CHANNEL_ID,
+            animation=media,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
+    if extension in VIDEO_EXTENSIONS:
+        return await application.bot.send_video(
+            chat_id=CHANNEL_ID,
+            video=media,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
+
+    return await application.bot.send_photo(
+        chat_id=CHANNEL_ID,
+        photo=media,
+        caption=caption,
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def post_quote():
     async with post_lock:
         quote, quote_number = current_quote()
         caption = prepare_caption(quote)
-        image_name, image_number, media_path = pick_allowed_media()
-
-        with open(media_path, "rb") as media:
-            extension = media_path.suffix.lower()
-
-            if extension in ANIMATION_EXTENSIONS:
-                message = await application.bot.send_animation(
-                    chat_id=CHANNEL_ID,
-                    animation=media,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                )
-            elif extension in VIDEO_EXTENSIONS:
-                message = await application.bot.send_video(
-                    chat_id=CHANNEL_ID,
-                    video=media,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                )
-            else:
-                message = await application.bot.send_photo(
-                    chat_id=CHANNEL_ID,
-                    photo=media,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML,
-                )
+        media_item, image_number = pick_allowed_media()
+        message = await send_media(media_item, caption)
 
         print(
             f"Posted quote {quote_number}/{len(quotes)} "
-            f"with media {image_number}/{len(images)} ({image_name}) "
+            f"with media {image_number}/{len(images)} ({media_item['name']}) "
             f"at {datetime.now(tz).isoformat()} "
             f"to chat id {message.chat.id}"
         )
@@ -328,7 +399,7 @@ async def post_quote():
         advance_image()
         save_state()
 
-        return quote_number, image_number, image_name
+        return quote_number, image_number, media_item["name"]
 
 
 def parse_run_date(value):
