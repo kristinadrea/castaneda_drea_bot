@@ -1,6 +1,14 @@
 .env
 *.local
 
+secrets/*
+!secrets/.gitkeep
+*.pem
+*.key
+id_rsa
+id_ed25519
+*.ppk
+
 data/*
 !data/.gitkeep
 
